@@ -6,13 +6,18 @@ const chalk = require('chalk');
 // Set the base URL
 const BASE_URL = 'https://api.kinghub.io/api/v1';
 
-// Function to read access and refresh tokens from hash.txt
+// Function to read tokens from hash.txt
 function readTokens() {
     const tokenFilePath = path.join(__dirname, 'hash.txt');
     try {
         const tokens = fs.readFileSync(tokenFilePath, 'utf-8').trim().split('\n').map(line => {
-            const [accessToken, refreshToken] = line.split(',');
-            return { accessToken, refreshToken };
+            const parts = line.split(',');
+            const accessToken = parts[0] || null;
+            const refreshToken = parts[1] || null;
+            const email = parts[2];
+            const password = parts[3];
+
+            return { accessToken, refreshToken, email, password };
         });
         return tokens;
     } catch (error) {
@@ -21,11 +26,31 @@ function readTokens() {
     }
 }
 
-// Function to update hash.txt with new access tokens
+// Function to update hash.txt with new tokens
 function updateTokens(tokens) {
     const tokenFilePath = path.join(__dirname, 'hash.txt');
-    const data = tokens.map(token => `${token.accessToken},${token.refreshToken}`).join('\n');
+    const data = tokens.map(token =>
+        `${token.accessToken || ''},${token.refreshToken || ''},${token.email},${token.password}`
+    ).join('\n');
     fs.writeFileSync(tokenFilePath, data, 'utf-8');
+}
+
+// Function to login and get new tokens
+async function login(email, password) {
+    try {
+        const response = await axios.post(`${BASE_URL}/auth/login`, {
+            email,
+            password,
+            code: ""
+        });
+
+        const { accessToken, refreshToken } = response.data.data;
+        console.log(chalk.green(`   • Login successful for ${email}.`));
+        return { accessToken, refreshToken };
+    } catch (error) {
+        console.error(chalk.red(`Error logging in for ${email}:`, error));
+        throw error;
+    }
 }
 
 // Function to refresh the access token
@@ -41,12 +66,23 @@ async function refreshToken(tokenData, index) {
         tokenData.accessToken = newAccessToken;
         return newAccessToken;
     } catch (error) {
-        console.error(chalk.red(`Error refreshing token for account ${index + 1}:`, error));
-        return null;
+        console.log(chalk.yellow(`   • Refresh token failed for account ${index + 1}. Trying to log in again.`));
+        try {
+            const newTokens = await login(tokenData.email, tokenData.password);
+
+            // Update token data with new tokens from login
+            tokenData.accessToken = newTokens.accessToken;
+            tokenData.refreshToken = newTokens.refreshToken;
+
+            return newTokens.accessToken;
+        } catch (loginError) {
+            console.error(chalk.red(`   • Failed to log in for account ${index + 1}:`, loginError));
+            return null;
+        }
     }
 }
 
-// Function to check if a request should refresh the token
+// Function to handle API requests with token refresh fallback
 async function requestWithTokenRefresh(fn, tokenData, index, ...args) {
     try {
         return await fn(tokenData.accessToken, ...args);
@@ -83,7 +119,6 @@ async function miningInfo(accessToken) {
 
     // Convert timeEndMining to local time
     const localTimeEndMining = new Date(timeEndMining * 1000).toLocaleString();
-    
     return { timeEndMining, localTimeEndMining, levelBoots, point };
 }
 
@@ -100,14 +135,12 @@ async function claimMining(accessToken) {
 async function upgradeBootsLevel(accessToken, currentBootLevel, currentPoints) {
     const maxBootLevel = 5;
 
-    // Check if already at the maximum level
     if (currentBootLevel >= maxBootLevel) {
         console.log(chalk.red('   • You are already at the maximum boot level.'));
         return;
     }
 
     try {
-        // Fetch boots configuration to check points requirement for the next level
         const response = await axios.get(`${BASE_URL}/public/config/boots`, {
             headers: { Authorization: `Bearer ${accessToken}` }
         });
@@ -151,11 +184,11 @@ function printHeader() {
     console.log(chalk.cyan.bold(line));
 }
 
-// Main function to check mining status and potentially claim reward for each account
+// Main function to process accounts
 async function processAccounts() {
-	printHeader();
+    printHeader();
     const tokenDataList = readTokens();
-    let shortestWaitTime = Infinity; // Variable to track shortest wait time for next claim
+    let shortestWaitTime = Infinity;
 
     if (tokenDataList.length === 0) {
         console.log(chalk.red('No tokens found in hash.txt.'));
@@ -167,36 +200,37 @@ async function processAccounts() {
         console.log(`\n${chalk.bold.blue(`Processing Account ${i + 1}:`)}`);
 
         try {
-            // Attempt to fetch user email with token refresh support
+            // If tokens are missing, perform login
+            if (!tokenData.accessToken || !tokenData.refreshToken) {
+                console.log(chalk.yellow(`   • Missing tokens for account ${i + 1}. Logging in...`));
+                const newTokens = await login(tokenData.email, tokenData.password);
+                tokenData.accessToken = newTokens.accessToken;
+                tokenData.refreshToken = newTokens.refreshToken;
+
+                // Save the updated tokens to hash.txt
+                updateTokens(tokenDataList);
+            }
+
             const email = await requestWithTokenRefresh(getUserDetails, tokenData, i);
 
-            // Fetch mining info with token refresh support
             const miningData = await requestWithTokenRefresh(miningInfo, tokenData, i);
             if (!miningData) continue;
 
             const { timeEndMining, localTimeEndMining, levelBoots, point } = miningData;
-            const currentTime = Math.floor(Date.now() / 1000); // Current time in seconds
 
-            // Print user and mining info in the specified format
             console.log(`${chalk.bold("   Email:")} ${chalk.cyan(email)}`);
             console.log(`${chalk.bold("   Boost Level:")} ${chalk.cyan(levelBoots)}`);
             console.log(`${chalk.bold("   Points:")} ${chalk.cyan(point)}`);
             console.log(`${chalk.bold("   Next Claim Time:")} ${chalk.cyan(localTimeEndMining)}`);
 
-            // Attempt to upgrade boots level if possible
             await requestWithTokenRefresh(upgradeBootsLevel, tokenData, i, levelBoots, point);
 
-            // Check if it's time to claim
-            if (timeEndMining <= currentTime) {
+            if (timeEndMining <= Math.floor(Date.now() / 1000)) {
                 console.log(chalk.yellow("   • It's time to claim rewards."));
                 await requestWithTokenRefresh(claimMining, tokenData, i);
-                // Re-check mining info to update the next claim time
-                const updatedMiningData = await requestWithTokenRefresh(miningInfo, tokenData, i);
-                console.log(`${chalk.bold("   • Next Claim Time after claiming:")} ${chalk.cyan(updatedMiningData.localTimeEndMining)}`);
             } else {
                 console.log(chalk.green("   • Next claim time has not yet arrived."));
-                // Calculate wait time until next claim for this account
-                const waitTime = (timeEndMining - currentTime) * 1000; // Convert to milliseconds
+                const waitTime = (timeEndMining - Math.floor(Date.now() / 1000)) * 1000;
                 shortestWaitTime = Math.min(shortestWaitTime, waitTime);
             }
         } catch (error) {
@@ -204,14 +238,12 @@ async function processAccounts() {
         }
     }
 
-    // Update the hash.txt with any refreshed tokens
     updateTokens(tokenDataList);
 
-    // Return the shortest wait time for the next claim
     return shortestWaitTime;
 }
 
-// Infinite loop to run processAccounts with a countdown
+// Infinite loop to process accounts
 (async function loopProcessAccounts() {
     while (true) {
         const waitTime = await processAccounts();
@@ -221,13 +253,13 @@ async function processAccounts() {
 
             while (remainingTime > 0) {
                 process.stdout.write(chalk.yellow(`\rCountdown: ${Math.floor(remainingTime / 1000)} seconds remaining...`));
-                await new Promise(resolve => setTimeout(resolve, 1000)); // Update every second
+                await new Promise(resolve => setTimeout(resolve, 1000));
                 remainingTime -= 1000;
             }
             console.log(chalk.green("\nCountdown complete. Rechecking claims...\n"));
         } else {
             console.log(chalk.red("No upcoming claims or unable to calculate wait time. Retrying shortly...\n"));
-            await new Promise(resolve => setTimeout(resolve, 60000)); // Default 1-minute retry delay
+            await new Promise(resolve => setTimeout(resolve, 60000));
         }
     }
 })();
