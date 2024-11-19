@@ -40,9 +40,11 @@ This project automates interactions with the KingHub API to manage user accounts
    Create a file named `hash.txt` in the root of the project directory. This file should contain your access and refresh tokens, separated by commas. Each line represents a different account.
 
    ```
-   accessToken1,refreshToken1
-   accessToken2,refreshToken2
+   accessToken1,refreshToken1,your_email_1,your_password_1
+   accessToken2,refreshToken2,your_email_2,your_password_2
    ```
+
+   you can start with ,,your_email_1,your_password_1 if you're lazy like me
 
 ## Usage
 
